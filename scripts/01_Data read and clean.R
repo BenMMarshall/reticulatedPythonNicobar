@@ -5,6 +5,7 @@ library(sf)
 library(CoordinateCleaner)
 library(geodata)
 library(ggplot2)
+library(terra)
 
 nicoGrids <- read_sf(here("data", "Nicobar 3x3 grids.gpkg"))
 plot(nicoGrids)
@@ -76,17 +77,45 @@ occDataSF <- st_as_sf(occData,
                       crs = 4326,
                       remove = FALSE)
 
+
+occExt <- ext(c(range(occDataSF$decimalLongitude)+c(-5,5), range(occDataSF$decimalLatitude)+c(-5,5)))
+
 # Read in raster data -----------------------------------------------------
 dir.create(here::here("data", "worldclim"))
 worldclim_global(var = "bio", res = 10, path = here::here("data", "worldclim"))
 
+climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_10m"))
+
+climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_10m", climFiles))
+
+climCrop <- crop(climRast, occExt)
+
+
+# Build bias layer --------------------------------------------------------
+
+hfRast <- rast(here::here("data", "humanFootprint", "hfp2022.tif"))
+hfCrop <- project(hfRast, climCrop)
+
+rescale <- function(x){(x-min(x, na.rm = TRUE))/(max(x, na.rm = TRUE) - min(x, na.rm = TRUE))}
+hfDataBNG <- hfDataBNG %>%
+  mutate(hfp2022 = rescale(hfp2022))
+
+weightedRandom <- spatSample(# x = hfData25m,
+  x = hfMasked,
+  # size = 10,
+  size = nrow(occData)*nPointMultiplier*nReps,
+  method = "weights",
+  na.rm = TRUE, as.df = FALSE, values = FALSE,
+  xy = TRUE)
+
 # Generate pseudo-absences ------------------------------------------------
 
-pseudoAbs <- create_psuedo_abs(occDataSF,
-                               hfBiasLayer = here("data", "humanFootprint", "hfp2022.tif"),
-                               nPointMultiplier = 3, nReps = 10,
-                               envLayers = read_stack_layers(layerLoc = here("data", "rasterLayers"),
-                                                             tar_sdm_layers))
+#### NEEDS TEARING APART
+# pseudoAbs <- create_psuedo_abs(occDataSF,
+#                                hfBiasLayer = here("data", "humanFootprint", "hfp2022.tif"),
+#                                nPointMultiplier = 3, nReps = 10,
+#                                envLayers = read_stack_layers(layerLoc = here("data", "rasterLayers"),
+#                                                              tar_sdm_layers))
 
 # Format data for model ---------------------------------------------------
 
