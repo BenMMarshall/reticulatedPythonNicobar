@@ -83,10 +83,10 @@ occExt <- ext(c(range(occDataSF$decimalLongitude)+c(-5,5), range(occDataSF$decim
 dir.create(here::here("data", "worldclim"))
 worldclim_global(var = "bio", res = 0.5, path = here::here("data", "worldclim"))
 
-climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_10m"))
-# climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_30s"))
-climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_10m", climFiles))
-# climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_30s", climFiles))
+# climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_10m"))
+climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_30s"))
+# climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_10m", climFiles))
+climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_30s", climFiles))
 
 climCrop <- crop(climRast, occExt)
 
@@ -99,7 +99,7 @@ rescale <- function(x){(x-min(x, na.rm = TRUE))/(max(x, na.rm = TRUE) - min(x, n
 hfDataBNG <- hfCrop %>%
   mutate(hfp2022 = rescale(hfp2022))
 
-nPointMultiplier = 3; nReps = 3
+nPointMultiplier = 3; nReps = 10
 
 occDataSimple <- occData %>%
   mutate(x = decimalLongitude,
