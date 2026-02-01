@@ -5,20 +5,24 @@ library(sf)
 library(CoordinateCleaner)
 library(geodata)
 library(ggplot2)
+library(ggrepel)
 library(terra)
+library(tidyterra)
+library(biomod2)
+library(stringr)
 
-nicoGrids <- read_sf(here("data", "Nicobar 3x3 grids.gpkg"))
-plot(nicoGrids)
-nicoIslands <- read_sf(here("data", "Nicobar_all_islands_UTM.gpkg"))
-plot(nicoIslands)
+seed <- 2026
+
+nicoIslands <- read_sf(here("data", "Nicobar_all_islands_UTM.gpkg")) %>%
+  st_transform(4326)
 
 pythonLocs <- read.csv(here("data", "sixty_Pythons_locations_UTM.csv")) %>%
   rename("x" = X, "y" = Y)
 
 pythonSF <- st_as_sf(pythonLocs,
-         coords = c("x", "y"),
-         crs = 32648,
-         remove = FALSE) %>%
+                     coords = c("x", "y"),
+                     crs = 32648,
+                     remove = FALSE) %>%
   st_transform(4326) %>%
   st_coordinates() %>%
   as.data.frame() %>%
@@ -29,11 +33,6 @@ pythonSF <- st_as_sf(pythonLocs,
 occGBIFdata <- read.csv(here("data", "gbif_malayopythonreticulatus.csv"),
                         sep = "\t")
 
-
-seed <- 2026
-
-
-institutionCode
 
 occData <- rbind(occGBIFdata %>%
                    ### FILTER OUT INACCURATE LOCATIONS
@@ -82,14 +81,14 @@ occExt <- ext(c(range(occDataSF$decimalLongitude)+c(-5,5), range(occDataSF$decim
 
 # Read in raster data -----------------------------------------------------
 dir.create(here::here("data", "worldclim"))
-worldclim_global(var = "bio", res = 10, path = here::here("data", "worldclim"))
+worldclim_global(var = "bio", res = 0.5, path = here::here("data", "worldclim"))
 
 climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_10m"))
-
+# climFiles <- list.files(here::here("data", "worldclim", "climate", "wc2.1_30s"))
 climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_10m", climFiles))
+# climRast <- rast(here::here("data", "worldclim", "climate", "wc2.1_30s", climFiles))
 
 climCrop <- crop(climRast, occExt)
-
 
 # Build bias layer --------------------------------------------------------
 
@@ -97,25 +96,47 @@ hfRast <- rast(here::here("data", "humanFootprint", "hfp2022.tif"))
 hfCrop <- project(hfRast, climCrop)
 
 rescale <- function(x){(x-min(x, na.rm = TRUE))/(max(x, na.rm = TRUE) - min(x, na.rm = TRUE))}
-hfDataBNG <- hfDataBNG %>%
+hfDataBNG <- hfCrop %>%
   mutate(hfp2022 = rescale(hfp2022))
 
+nPointMultiplier = 3; nReps = 3
+
+occDataSimple <- occData %>%
+  mutate(x = decimalLongitude,
+         y = decimalLatitude) %>%
+  mutate(resp = 1) %>%
+  select(x, y, resp)
+
 weightedRandom <- spatSample(# x = hfData25m,
-  x = hfMasked,
+  x = hfDataBNG,
   # size = 10,
   size = nrow(occData)*nPointMultiplier*nReps,
   method = "weights",
   na.rm = TRUE, as.df = FALSE, values = FALSE,
   xy = TRUE)
 
+fullRespData <- rbind(occDataSimple, weightedRandom %>%
+                        mutate(resp = 0))
+
+PAtable <- as.data.frame(matrix(FALSE, nrow = nrow(fullRespData), ncol = nReps))
+names(PAtable) <- paste0("PA", 1:nReps)
+# known locations always included
+PAtable[which(fullRespData$resp == 1),] <- TRUE
+
 # Generate pseudo-absences ------------------------------------------------
 
-#### NEEDS TEARING APART
-# pseudoAbs <- create_psuedo_abs(occDataSF,
-#                                hfBiasLayer = here("data", "humanFootprint", "hfp2022.tif"),
-#                                nPointMultiplier = 3, nReps = 10,
-#                                envLayers = read_stack_layers(layerLoc = here("data", "rasterLayers"),
-#                                                              tar_sdm_layers))
+for (i in 1:ncol(PAtable)) PAtable[sample(which(PAtable[, i] == FALSE),
+                                          nrow(occData)*nPointMultiplier), i] = TRUE
+
+fullRespData <- as_spatvector(fullRespData, geom = c("x", "y")) %>%
+  select(resp)
+
+print("- bm_PseudoAbsences start")
+
+pseudoAbs <- bm_PseudoAbsences(resp.var = fullRespData,
+                               expl.var = climCrop,
+                               strategy = "user.defined",
+                               user.table = PAtable)
 
 # Format data for model ---------------------------------------------------
 
@@ -144,8 +165,8 @@ biomodModels <- BIOMOD_Modeling(bm.format = biomodData,
                                 models = c("ANN",
                                            "GBM",
                                            "GLM",
-                                           # "MAXNET",
-                                           # "XGBOOST",
+                                           "MAXNET",
+                                           "XGBOOST",
                                            "RF"
                                 ),
                                 CV.strategy = "user.defined",
@@ -174,7 +195,7 @@ biomodEns <- BIOMOD_EnsembleModeling(bm.mod = biomodModels,
                                                  "EMmedian", #"EMca",
                                                  "EMwmean"),
                                      metric.select = c("TSS"),
-                                     metric.select.thresh = c(0.25),
+                                     metric.select.thresh = c(0.5),
                                      metric.eval = c("TSS", "ROC"),
                                      var.import = 3,
                                      EMci.alpha = 0.05,
@@ -184,12 +205,11 @@ biomodEns <- BIOMOD_EnsembleModeling(bm.mod = biomodModels,
 
 # Project models to area of interest --------------------------------------
 
-biomodForecast <- BIOMOD_EnsembleForecasting(bm.em = biomodModels,
+biomodForecast <- BIOMOD_EnsembleForecasting(bm.em = biomodEns,
                                              proj.name = "CurrentEM_",
                                              ########### CROP STUFF TO NICOBAR
-                                             new.env = read_stack_layers(layerLoc = here("data", "GIS data", "SDM Layers"),
-                                                                         tar_sdm_layers) %>%
-                                               crop(tar_patchList$Wessex),
+                                             new.env = climCrop %>%
+                                               crop(st_bbox(nicoIslands)+c(-5,-5,5,5)),
                                              ########### CROP STUFF TO NICOBAR
                                              models.chosen = get_built_models(biomodEns)[
                                                stringr::str_detect(get_built_models(biomodEns), "EMwmeanByTSS")],
@@ -200,4 +220,132 @@ biomodForecast <- BIOMOD_EnsembleForecasting(bm.em = biomodModels,
 
 # Save final suitability raster -------------------------------------------
 
-save_proj_layer(tar_biomodForecast_fallow)
+forecastTerra <- rast(here::here(biomodForecast@sp.name,
+                                 paste0("proj_", biomodForecast@proj.name),
+                                 paste0("proj_", biomodForecast@proj.name, "_", biomodForecast@sp.name, "_ensemble.tif")))
+
+plot(forecastTerra)
+
+
+# Output plots ------------------------------------------------------------
+## can also be done for single models as well as the ensemble
+
+species <- biomodEns@sp.name
+
+ggplotThemeCombo <-
+  theme_bw() +
+  theme(
+    text = element_text(colour = "grey25"),
+    line = element_line(colour = "grey25"),
+    plot.title = element_text(face = 2),
+    axis.title = element_text(face = 2),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    strip.text = element_text(angle = 0, face = 4, hjust = 0, vjust = 1)
+    # legend.position = "none"
+  )
+
+# Single models -----------------------------------------------------------
+
+evalModels <- bm_PlotEvalMean(bm.out = biomodModels)
+
+evalPlot <- evalModels$tab %>%
+  ggplot() +
+  geom_errorbar(aes(x = mean1, ymin = mean2-sd2, ymax = mean2+sd2, colour = name),
+                width = 0.001)+
+  geom_errorbarh(aes(y = mean2, xmin = mean1-sd1, xmax = mean1+sd1, colour = name),
+                 height = 0.001)+
+  geom_point(aes(x = mean1, y = mean2, colour = name), size = 3) +
+  labs(y = "TSS", x = "ROC", colour = "Model") +
+  ggplotThemeCombo
+
+evalPlot
+
+varImportByModel <- bm_PlotVarImpBoxplot(bm.out = biomodModels, group.by = c('expl.var', 'algo', 'algo'))
+
+varImportPlot <- varImportByModel$tab %>%
+  mutate(expl.var = reorder(expl.var, var.imp, FUN = max)) %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.85) +
+  geom_boxplot(aes(y = expl.var, x = var.imp, colour = algo, fill = algo)) +
+  facet_grid(cols = vars(algo)) +
+  ggplotThemeCombo +
+  theme(legend.position = "none")
+
+varImportPlot
+
+respCurve <- bm_PlotResponseCurves(bm.out = biomodModels,
+                                   models.chosen = get_built_models(biomodModels),
+                                   fixed.var = 'mean')
+
+respDistPlot <- respCurve$tab %>%
+  mutate(model.type = str_extract(pred.name, "[^_]+$")) %>%
+  ggplot() +
+  # geom_rect(data = wessexRanges, aes(xmin = min, xmax = max,
+  #                                    ymin = -Inf, ymax = Inf), fill = "#85AB7A", alpha = 0.2) +
+  geom_path(aes(x = expl.val, y = pred.val, group = pred.name, colour = model.type)) +
+  facet_wrap(facet = vars(expl.name), scales = "free") +
+  ggplotThemeCombo
+
+varImportPlot
+
+# Ensemble models ---------------------------------------------------------
+
+evalEns <- bm_PlotEvalMean(bm.out = biomodEns, group.by = 'full.name')
+
+evalEnsPlot <- evalEns$tab %>%
+  mutate(name = str_extract_all(name, "EM.*?ByTSS", simplify = TRUE)) %>%
+  ggplot() +
+  geom_point(aes(x = mean1, y = mean2, colour = name, fill = name),
+             size = 4, pch = 21) +
+  geom_text_repel(aes(x = mean1, y = mean2, colour = name, label = name),
+                  hjust = 0, box.padding = unit(1.2, "lines")) +
+  labs(y = "TSS", x = "ROC") +
+  ggplotThemeCombo +
+  theme(legend.position = "none")
+
+evalEnsPlot
+
+varImport <- bm_PlotVarImpBoxplot(bm.out = biomodEns,
+                                  group.by = c('expl.var', 'algo', 'merged.by.run'))
+
+varImportPlot <- varImport$tab %>%
+  filter(algo %in% c("EMwmean", "EMmean", "EMmedian", "EMca")) %>%
+  mutate(expl.var = reorder(expl.var, var.imp, FUN = max)) %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.85) +
+  # geom_hline(yintercept = seq(1.5,11.5,1), linetype = "dashed", alpha = 0.25) +
+  geom_boxplot(aes(y = expl.var, x = var.imp, colour = algo, fill = algo)) +
+  scale_colour_manual(values = c("#DCBD0A",
+                                 "#CD602A",
+                                 "#9F7E93",
+                                 "#85AB7A")) +
+  scale_fill_manual(values = c("#DCBD0A",
+                               "#CD602A",
+                               "#9F7E93",
+                               "#85AB7A")) +
+  ggplotThemeCombo +
+  theme_bw() +
+  theme(
+    # panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "bottom")
+
+varImportPlot
+
+respCurve <- bm_PlotResponseCurves(bm.out = biomodEns,
+                                   models.chosen = get_built_models(biomodEns)[
+                                     stringr::str_detect(get_built_models(biomodEns),
+                                                         "EMwmeanByTSS")],
+                                   fixed.var = 'mean')
+
+respDistPlot <- respCurve$tab %>%
+  ggplot() +
+  geom_path(aes(x = expl.val, y = pred.val, group = expl.name)) +
+  facet_wrap(facet = vars(expl.name), scales = "free") +
+  ggplotThemeCombo
+
+respDistPlot
